@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+ClaudeUsage.app/
+Package.resolved
+.DS_Store
