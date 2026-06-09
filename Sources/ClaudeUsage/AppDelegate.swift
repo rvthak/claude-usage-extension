@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let service = UsageService()
     private var cancellables = Set<AnyCancellable>()
     private var timer: Timer?
+    private var globalClickMonitor: Any?
     private let normalInterval: TimeInterval = 10 * 60
     private let backoffInterval: TimeInterval = 15 * 60
 
@@ -54,9 +55,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func togglePopover(_ sender: Any?) {
         guard let button = statusItem.button else { return }
         if popover.isShown {
-            popover.performClose(sender)
+            closePopover(sender)
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // Close the popover on any click outside it — including the desktop or
+            // other applications, which `.transient` alone doesn't catch for a
+            // menu-bar-only (LSUIElement) app.
+            globalClickMonitor = NSEvent.addGlobalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown]
+            ) { [weak self] _ in
+                self?.closePopover(nil)
+            }
+        }
+    }
+
+    private func closePopover(_ sender: Any?) {
+        popover.performClose(sender)
+        if let monitor = globalClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            globalClickMonitor = nil
         }
     }
 
