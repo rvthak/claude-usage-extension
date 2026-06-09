@@ -25,7 +25,12 @@ struct PopoverView: View {
     @ViewBuilder
     private var content: some View {
         if let error = service.snapshot.error {
-            Text("Error").font(.headline).foregroundColor(.red)
+            Text(errorTitle).font(.headline).foregroundColor(.red)
+            if let hint = errorHint {
+                Text(hint)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
             Text(error)
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -41,6 +46,22 @@ struct PopoverView: View {
                 utilization: service.snapshot.sevenDayUtilization,
                 resetAt: service.snapshot.sevenDayResetAt)
         }
+    }
+
+    private var errorTitle: String {
+        if service.snapshot.isAuthError { return "Sign-in needed" }
+        if service.snapshot.isRateLimited { return "Rate limited" }
+        return "Error"
+    }
+
+    private var errorHint: String? {
+        if service.snapshot.isAuthError {
+            return "The Claude Code token expired or the Keychain item changed. Hit Refresh; if macOS asks, click Always Allow."
+        }
+        if service.snapshot.isRateLimited {
+            return "Too many requests — backing off automatically. Try again in a few minutes."
+        }
+        return nil
     }
 
     private func row(label: String, utilization: Int, resetAt: Date?) -> some View {

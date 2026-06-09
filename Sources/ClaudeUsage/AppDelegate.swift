@@ -37,7 +37,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusBarTitle(_ snapshot: UsageSnapshot) {
         guard let button = statusItem.button else { return }
         if snapshot.error != nil {
-            button.title = "!"
+            if snapshot.isAuthError {
+                button.title = "🔒"          // token expired / Keychain re-auth needed
+            } else if snapshot.isRateLimited {
+                button.title = "⏳"          // rate limited, backing off
+            } else {
+                button.title = "!"           // other error
+            }
         } else if snapshot.lastUpdated != nil {
             button.title = "5h \(snapshot.fiveHourUtilization)% · 7d \(snapshot.sevenDayUtilization)%"
         } else {

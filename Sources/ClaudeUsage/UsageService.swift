@@ -11,18 +11,19 @@ struct UsageSnapshot {
     var error: String?
     var isLoading: Bool = false
     var isRateLimited: Bool = false
+    var isAuthError: Bool = false
 }
 
 final class UsageService: ObservableObject {
     @Published private(set) var snapshot = UsageSnapshot()
     private var cachedToken: String?
+    private var cachedTokenExpiry: Date?
 
     @MainActor
     func fetch() async {
         snapshot.isLoading = true
         do {
-            let token = try accessToken()
-            let response = try await fetchOAuthUsage(accessToken: token)
+            let response = try await fetchWithFreshTokenIfNeeded()
             snapshot = UsageSnapshot(
                 fiveHourUtilization: Int(response.fiveHour?.utilization ?? 0),
                 sevenDayUtilization: Int(response.sevenDay?.utilization ?? 0),
@@ -35,22 +36,55 @@ final class UsageService: ObservableObject {
             )
         } catch let error as NSError {
             let isRateLimit = error.code == 429
-            if isRateLimit { cachedToken = nil }
+            let isAuth = error.code == 401 || error.domain == "Keychain"
+            // Any auth/rate-limit failure means our cached token is suspect; drop it
+            // so the next attempt re-reads the Keychain for a freshly rotated token.
+            if isRateLimit || error.code == 401 { invalidateToken() }
             snapshot.error = error.localizedDescription
             snapshot.isLoading = false
             snapshot.isRateLimited = isRateLimit
+            snapshot.isAuthError = isAuth
+        }
+    }
+
+    /// Fetches usage, transparently retrying once with a fresh Keychain read if the
+    /// access token has expired (401). The CLI rotates the token every few hours.
+    private func fetchWithFreshTokenIfNeeded() async throws -> OAuthUsageResponse {
+        let token = try accessToken()
+        do {
+            return try await fetchOAuthUsage(accessToken: token)
+        } catch let error as NSError where error.code == 401 {
+            // Stale token — force a re-read and try once more before surfacing the error.
+            invalidateToken()
+            let fresh = try accessToken()
+            return try await fetchOAuthUsage(accessToken: fresh)
         }
     }
 
     private func accessToken() throws -> String {
-        if let token = cachedToken { return token }
-        let token = try readOAuthAccessToken()
-        cachedToken = token
-        return token
+        // Reuse the cached token only while it is still valid (with a safety skew).
+        if let token = cachedToken, let expiry = cachedTokenExpiry,
+           expiry.timeIntervalSinceNow > 60 {
+            return token
+        }
+        let creds = try readOAuthCredentials()
+        cachedToken = creds.accessToken
+        cachedTokenExpiry = creds.expiresAtDate
+        return creds.accessToken
+    }
+
+    private func invalidateToken() {
+        cachedToken = nil
+        cachedTokenExpiry = nil
     }
 }
 
-private func readOAuthAccessToken() throws -> String {
+private struct OAuthCredentials {
+    let accessToken: String
+    let expiresAtDate: Date?
+}
+
+private func readOAuthCredentials() throws -> OAuthCredentials {
     var result: AnyObject?
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
@@ -67,13 +101,23 @@ private func readOAuthAccessToken() throws -> String {
         )
     }
     let creds = try JSONDecoder().decode(KeychainCredentials.self, from: data)
-    return creds.claudeAiOauth.accessToken
+    return OAuthCredentials(
+        accessToken: creds.claudeAiOauth.accessToken,
+        expiresAtDate: creds.claudeAiOauth.expiresAtDate
+    )
 }
 
 private struct KeychainCredentials: Decodable {
     let claudeAiOauth: OAuthData
     struct OAuthData: Decodable {
         let accessToken: String
+        // Claude Code stores this as a Unix timestamp in milliseconds.
+        let expiresAt: Double?
+
+        var expiresAtDate: Date? {
+            guard let expiresAt else { return nil }
+            return Date(timeIntervalSince1970: expiresAt / 1000)
+        }
     }
 }
 
@@ -87,15 +131,25 @@ private struct OAuthUsageResponse: Decodable {
     }
 
     struct UsagePeriod: Decodable {
+        // Optional + defaulted so a partial response (e.g. around a reset window, or
+        // an account without a given bucket) degrades gracefully instead of throwing
+        // a "data couldn't be read because it is missing" decode error.
         let utilization: Double
-        let resetsAt: String
+        let resetsAt: String?
 
         enum CodingKeys: String, CodingKey {
             case utilization
             case resetsAt = "resets_at"
         }
 
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            utilization = try c.decodeIfPresent(Double.self, forKey: .utilization) ?? 0
+            resetsAt = try c.decodeIfPresent(String.self, forKey: .resetsAt)
+        }
+
         var resetsAtDate: Date? {
+            guard let resetsAt else { return nil }
             let f = ISO8601DateFormatter()
             f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             if let d = f.date(from: resetsAt) { return d }
