@@ -48,9 +48,46 @@ open ClaudeUsage.app
 
 `build.sh` runs `swift build -c release` and wraps the binary into `ClaudeUsage.app` with a proper `Info.plist` (`LSUIElement = true`, so no Dock icon).
 
+## One-time code-signing setup (recommended)
+
+The app reads the `Claude Code-credentials` Keychain item. macOS records your **Always Allow** grant against the app's code signature, so the signature must be **stable**. If the app is ad-hoc signed, the grant doesn't stick — and because Claude Code rewrites the credential item every few hours when it rotates the OAuth token, macOS keeps re-prompting for your keychain password.
+
+`build.sh` looks for a stable self-signed code-signing identity named `ClaudeUsage Code Signing`. Create it once from the terminal (no Keychain Access GUI needed):
+
+```bash
+# 1. Generate a self-signed code-signing key + cert
+TMP="$(mktemp -d)"
+openssl req -x509 -newkey rsa:2048 -keyout "$TMP/key.pem" -out "$TMP/cert.pem" \
+  -days 3650 -nodes -subj "/CN=ClaudeUsage Code Signing" \
+  -addext "basicConstraints=critical,CA:false" \
+  -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=critical,codeSigning"
+
+# 2. Bundle it into a PKCS#12 (any passphrase works; used only for the import below)
+openssl pkcs12 -export -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \
+  -out "$TMP/identity.p12" -passout pass:claudeusage -legacy
+
+# 3. Import into your login keychain, authorizing codesign to use the key
+security import "$TMP/identity.p12" -k "$HOME/Library/Keychains/login.keychain-db" \
+  -P claudeusage -T /usr/bin/codesign
+
+# 4. Clean up the temporary key material
+rm -rf "$TMP"
+```
+
+`security find-identity` will list it as `CSSMERR_TP_NOT_TRUSTED` — that's expected for a self-signed cert and doesn't affect signing. The cert is valid for 10 years and persists across rebuilds, so you only do this once.
+
+Then (re)build so the app picks up the stable identity:
+
+```bash
+./build.sh   # prints "Signed with stable identity: ClaudeUsage Code Signing"
+```
+
+If you skip this step, `build.sh` falls back to ad-hoc signing and macOS will keep asking for your keychain password every few hours.
+
 ## First-launch keychain prompt
 
-On first launch macOS will ask for your **login keychain password** (the same one you use to log in to your Mac) before allowing the unsigned binary to read the `Claude Code-credentials` item. Click **Always Allow** so it doesn't reappear every refresh. If you click "Allow" once by mistake, open Keychain Access, find `Claude Code-credentials`, and add `ClaudeUsage.app` to its Access Control list.
+On first launch macOS will ask for your **login keychain password** (the same one you use to log in to your Mac) before allowing the app to read the `Claude Code-credentials` item. Click **Always Allow** so it doesn't reappear. With the stable code-signing identity above in place, that grant survives both rebuilds and Claude Code's periodic token rotations. If you click "Allow" once by mistake, open Keychain Access, find `Claude Code-credentials`, and add `ClaudeUsage.app` to its Access Control list.
 
 ## Project layout
 
