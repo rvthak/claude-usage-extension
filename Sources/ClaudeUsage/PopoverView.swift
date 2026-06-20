@@ -49,14 +49,20 @@ struct PopoverView: View {
     }
 
     private var errorTitle: String {
-        if service.snapshot.isAuthError { return "Sign-in needed" }
+        if service.snapshot.isAuthError {
+            return service.snapshot.loggedOut ? "Sign-in needed" : "Token refreshing"
+        }
         if service.snapshot.isRateLimited { return "Rate limited" }
         return "Error"
     }
 
     private var errorHint: String? {
         if service.snapshot.isAuthError {
-            return "The Claude Code token expired or the Keychain item changed. Hit Refresh; if macOS asks, click Always Allow."
+            // Distinguish the two auth states the CLI reports for us: a genuine
+            // sign-out needs the user to act; a stale token resolves on its own.
+            return service.snapshot.loggedOut
+                ? "Claude Code is signed out. Run `claude /login` in a terminal, then hit Refresh."
+                : "Claude Code's token is stale; it refreshes the next time you run any Claude Code command. No action needed."
         }
         if service.snapshot.isRateLimited {
             return "Too many requests — backing off automatically. Try again in a few minutes."

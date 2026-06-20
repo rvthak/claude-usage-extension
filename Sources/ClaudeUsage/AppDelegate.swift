@@ -39,7 +39,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         if snapshot.error != nil {
             if snapshot.isAuthError {
-                button.title = "🔒"          // token expired / Keychain re-auth needed
+                // 🔒 only when the CLI confirms a real sign-out (user must act);
+                // 🔄 for a stale token the CLI will refresh on its own.
+                button.title = snapshot.loggedOut ? "🔒" : "🔄"
             } else if snapshot.isRateLimited {
                 button.title = "⏳"          // rate limited, backing off
             } else {

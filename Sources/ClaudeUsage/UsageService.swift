@@ -12,6 +12,10 @@ struct UsageSnapshot {
     var isLoading: Bool = false
     var isRateLimited: Bool = false
     var isAuthError: Bool = false
+    // Authoritative auth state from `claude auth status`: true only when the CLI
+    // itself reports we're signed out (refresh token gone / revoked), as opposed
+    // to a merely stale access token the CLI will refresh on its next run.
+    var loggedOut: Bool = false
 }
 
 final class UsageService: ObservableObject {
@@ -36,14 +40,34 @@ final class UsageService: ObservableObject {
             )
         } catch let error as NSError {
             let isRateLimit = error.code == 429
-            let isAuth = error.code == 401 || error.domain == "Keychain"
+            let isAuth = error.code == 401 || error.domain == "Keychain" || error.domain == "Auth"
             // Any auth/rate-limit failure means our cached token is suspect; drop it
             // so the next attempt re-reads the Keychain for a freshly rotated token.
-            if isRateLimit || error.code == 401 { invalidateToken() }
-            snapshot.error = error.localizedDescription
+            if isRateLimit || isAuth { invalidateToken() }
+
+            var message = error.localizedDescription
+            var loggedOut = false
+            if isAuth {
+                // Ask Claude Code itself for the authoritative state. This lets us
+                // tell a genuinely signed-out user (must run `claude /login`) apart
+                // from a merely stale access token (the CLI will refresh it on its
+                // next run — no user action needed). Falls through to the raw error
+                // if the CLI can't be found or doesn't answer.
+                if let status = await cliAuthStatus() {
+                    if status.loggedIn {
+                        message = "Claude Code's access token is stale. It refreshes automatically the next time you run any Claude Code command."
+                    } else {
+                        loggedOut = true
+                        message = "Not signed in to Claude Code. Run `claude /login` in a terminal, then hit Refresh."
+                    }
+                }
+            }
+
+            snapshot.error = message
             snapshot.isLoading = false
             snapshot.isRateLimited = isRateLimit
             snapshot.isAuthError = isAuth
+            snapshot.loggedOut = loggedOut
         }
     }
 
@@ -86,6 +110,73 @@ final class UsageService: ObservableObject {
         cachedToken = nil
         cachedTokenExpiry = nil
     }
+}
+
+// MARK: - Authoritative auth state via the Claude Code CLI
+
+private struct CLIAuthStatus: Decodable {
+    let loggedIn: Bool
+}
+
+/// Shells out to `claude auth status --json` to get an authoritative auth state.
+/// Read-only: when the token is healthy this is a pure read (it does not rotate
+/// the refresh token), so it's safe to call without risking the double-writer
+/// race that self-refreshing would introduce. Returns nil if the CLI can't be
+/// located or doesn't answer in time.
+private func cliAuthStatus() async -> CLIAuthStatus? {
+    await Task.detached(priority: .utility) { () -> CLIAuthStatus? in
+        guard let exe = findClaudeBinary() else { return nil }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: exe)
+        proc.arguments = ["auth", "status", "--json"]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        do { try proc.run() } catch { return nil }
+
+        // Watchdog: never let a hung CLI block a refresh cycle.
+        let killer = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: killer)
+
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        killer.cancel()
+
+        guard proc.terminationStatus == 0 else { return nil }
+        return try? JSONDecoder().decode(CLIAuthStatus.self, from: data)
+    }.value
+}
+
+/// Locates the `claude` executable. A menu-bar app launched from Finder doesn't
+/// inherit the user's shell PATH, so probe the known install locations first and
+/// fall back to resolving through a login shell.
+private func findClaudeBinary() -> String? {
+    let fm = FileManager.default
+    let home = fm.homeDirectoryForCurrentUser.path
+    let candidates = [
+        "\(home)/.local/bin/claude",
+        "\(home)/.claude/local/claude",
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+    ]
+    for path in candidates where fm.isExecutableFile(atPath: path) {
+        return path
+    }
+    let shell = Process()
+    shell.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    shell.arguments = ["-lc", "command -v claude"]
+    let out = Pipe()
+    shell.standardOutput = out
+    shell.standardError = Pipe()
+    do { try shell.run() } catch { return nil }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    shell.waitUntilExit()
+    let path = String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    if let path, !path.isEmpty, fm.isExecutableFile(atPath: path) {
+        return path
+    }
+    return nil
 }
 
 private struct OAuthCredentials {
