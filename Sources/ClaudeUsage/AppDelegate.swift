@@ -86,7 +86,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func scheduleNextRefresh() {
         timer?.invalidate()
-        let interval = service.snapshot.isRateLimited ? backoffInterval : normalInterval
+        // Back off on auth errors too, not just explicit rate limits: a stale-token
+        // window shouldn't keep polling the API every few minutes with a token we
+        // already know is bad, which can keep the account rate-limited and interfere
+        // with Claude Code's own token refresh.
+        let shouldBackOff = service.snapshot.isRateLimited || service.snapshot.isAuthError
+        let interval = shouldBackOff ? backoffInterval : normalInterval
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             self?.refresh()
         }

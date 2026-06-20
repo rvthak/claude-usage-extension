@@ -47,18 +47,14 @@ final class UsageService: ObservableObject {
         }
     }
 
-    /// Fetches usage, transparently retrying once with a fresh Keychain read if the
-    /// access token has expired (401). The CLI rotates the token every few hours.
+    /// Fetches usage with whatever access token Claude Code currently has stored.
+    /// There is deliberately no retry-on-401 here: the extension can't refresh
+    /// tokens (that's Claude Code's job), so re-reading the Keychain would return
+    /// the same rejected token and the extra request would only burn the account's
+    /// shared rate limit — which can in turn starve the CLI's own token refresh.
     private func fetchWithFreshTokenIfNeeded() async throws -> OAuthUsageResponse {
         let token = try accessToken()
-        do {
-            return try await fetchOAuthUsage(accessToken: token)
-        } catch let error as NSError where error.code == 401 {
-            // Stale token — force a re-read and try once more before surfacing the error.
-            invalidateToken()
-            let fresh = try accessToken()
-            return try await fetchOAuthUsage(accessToken: fresh)
-        }
+        return try await fetchOAuthUsage(accessToken: token)
     }
 
     private func accessToken() throws -> String {
@@ -68,6 +64,19 @@ final class UsageService: ObservableObject {
             return token
         }
         let creds = try readOAuthCredentials()
+        // The extension can't refresh tokens — that's Claude Code's job. If the
+        // token Claude Code stored has already expired (e.g. after the laptop slept
+        // through its lifetime), don't send it to the API: that just 401-storms and
+        // can trip an account-level rate limit that interferes with the CLI's own
+        // refresh. Surface a clean auth state and wait for the CLI to rotate it.
+        if let expiry = creds.expiresAtDate, expiry.timeIntervalSinceNow <= 60 {
+            invalidateToken()
+            throw NSError(
+                domain: "Auth",
+                code: 401,
+                userInfo: [NSLocalizedDescriptionKey: "Access token expired. Waiting for Claude Code to refresh it — run any Claude Code command to renew."]
+            )
+        }
         cachedToken = creds.accessToken
         cachedTokenExpiry = creds.expiresAtDate
         return creds.accessToken
